@@ -95,10 +95,12 @@ Photonics
 PyPI
 Pygments
 QAOA
+QCI
 QCaaS
 QEC
 QIR
 QIS
+QOP
 QPP
 QPU
 QPUs

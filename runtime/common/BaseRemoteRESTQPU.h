@@ -12,8 +12,10 @@
 #include "common/Environment.h"
 #include "common/ExecutionContext.h"
 #include "common/Executor.h"
+#include "common/ExtraPayloadProvider.h"
 #include "common/FmtCore.h"
 #include "common/Logger.h"
+#include "common/Resources.h"
 #include "common/RestClient.h"
 #include "common/RuntimeMLIR.h"
 #include "cudaq.h"
@@ -29,7 +31,7 @@
 #include "cudaq/Optimizer/Dialect/Quake/QuakeOps.h"
 #include "cudaq/Optimizer/Transforms/Passes.h"
 #include "cudaq/Support/Plugin.h"
-#include "cudaq/Support/TargetConfig.h"
+#include "cudaq/Support/TargetConfigYaml.h"
 #include "cudaq/operators.h"
 #include "cudaq/platform/qpu.h"
 #include "cudaq/platform/quantum_platform.h"
@@ -61,6 +63,8 @@
 namespace nvqir {
 // QIR helper to retrieve the output log.
 std::string_view getQirOutputLog();
+cudaq::Resources *getResourceCounts();
+bool isUsingResourceCounterSimulator();
 } // namespace nvqir
 
 namespace cudaq {
@@ -205,6 +209,18 @@ public:
   void setExecutionContext(cudaq::ExecutionContext *context) override {
     if (!context)
       return;
+
+    // This check ensures that a kernel is not called whilst actively being
+    // used for resource counting (implying that the kernel was somehow
+    // invoked from inside the choice function). This check may want to
+    // be expanded more broadly to ensure that the execution context is
+    // always fully reset, implying the end of the invocation, being being
+    // set again, signaling a new invocation.
+    if (nvqir::isUsingResourceCounterSimulator() &&
+        context->name != "resource-count")
+      throw std::runtime_error(
+          "Illegal use of resource counter simulator! (Did you attempt to run "
+          "a kernel inside of a choice function?)");
 
     cudaq::info("Remote Rest QPU setting execution context to {}",
                 context->name);
@@ -358,8 +374,9 @@ public:
     // Create the ServerHelper for this QPU and give it the backend config
     serverHelper = cudaq::registry::get<cudaq::ServerHelper>(qpuName);
     if (!serverHelper) {
-      throw std::runtime_error("ServerHelper not found for target");
+      throw std::runtime_error("ServerHelper not found for target: " + qpuName);
     }
+
     serverHelper->initialize(backendConfig);
     serverHelper->updatePassPipeline(platformPath, passPipelineConfig);
     cudaq::info("Retrieving executor with name {}", qpuName);
@@ -371,6 +388,14 @@ public:
 
     // Give the server helper to the executor
     executor->setServerHelper(serverHelper.get());
+
+    // Construct the runtime target
+    RuntimeTarget runtimeTarget;
+    runtimeTarget.config = config;
+    runtimeTarget.name = mutableBackend;
+    runtimeTarget.description = config.Description;
+    runtimeTarget.runtimeConfig = backendConfig;
+    serverHelper->setRuntimeTarget(runtimeTarget);
   }
 
   /// @brief Conditionally form an output_names JSON object if this was for QIR
@@ -621,6 +646,20 @@ public:
         pm.addPass(cudaq::opt::createQuakeSynthesizer(kernelName, updatedArgs));
       }
       pm.addPass(mlir::createCanonicalizerPass());
+      if (executionContext && executionContext->name == "resource-count") {
+        // Each pass may run in a separate thread, so we have to make sure to
+        // grab this reference in this thread
+        auto resource_counts = nvqir::getResourceCounts();
+        std::function<void(std::string, size_t, size_t)> f =
+            [&](std::string gate, size_t nControls, size_t count) {
+              cudaq::info("Appending: {}", gate);
+              resource_counts->appendInstruction(gate, nControls, count);
+            };
+        cudaq::opt::ResourceCountPreprocessOptions opt{f};
+        pm.addNestedPass<mlir::func::FuncOp>(
+            opt::createResourceCountPreprocess(opt));
+        pm.addPass(mlir::createCanonicalizerPass());
+      }
       if (disableMLIRthreading || enablePrintMLIREachPass)
         moduleOp.getContext()->disableMultithreading();
       if (enablePrintMLIREachPass)
@@ -710,7 +749,8 @@ public:
     } else
       modules.emplace_back(kernelName, moduleOp);
 
-    if (emulate) {
+    if (emulate ||
+        (executionContext && executionContext->name == "resource-count")) {
       // If we are in emulation mode, we need to first get a full QIR
       // representation of the code. Then we'll map to an LLVM Module, create a
       // JIT ExecutionEngine pointer and use that for execution
@@ -816,6 +856,15 @@ public:
     // After performing lowerQuakeCode, check to see if we are simply drawing
     // the circuit. If so, perform the trace here and then return.
     if (executionContext->name == "tracer" && jitEngines.size() == 1) {
+      cudaq::getExecutionManager()->setExecutionContext(executionContext);
+      invokeJITKernelAndRelease(jitEngines[0], kernelName);
+      cudaq::getExecutionManager()->resetExecutionContext();
+      jitEngines.clear();
+      return;
+    }
+
+    if (executionContext->name == "resource-count") {
+      assert(jitEngines.size() == 1);
       cudaq::getExecutionManager()->setExecutionContext(executionContext);
       invokeJITKernelAndRelease(jitEngines[0], kernelName);
       cudaq::getExecutionManager()->resetExecutionContext();
